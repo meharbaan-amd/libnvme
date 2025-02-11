@@ -119,10 +119,7 @@ void *handle_client(void *client_sock_ptr) {
 
 		if (bytes_received>0) {
 			printf("Received from master.\n");
-			print_hex("nvme_cmd==>", (void*)req_data.nvme_cmd, NVME_REQ_CMD_LEN);
-			printf("payload_len==>%d\n", req_data.payload_len);
-			print_hex("payload==>", (void*)req_data.payload, req_data.payload_len);
-
+			
 			if (!do_admin_raw_breck(g_ep, &req_data, &resp_data))
 			{
 				if (send(client_sock, &resp_data, sizeof(cmd_mvni_resp_t), 0) < 0)
@@ -756,14 +753,100 @@ typedef enum breck_nvme_cmd_opcodes_e {
 	BRECK_NVME_CMD_SET_FEATURES = 0x09,
 	BRECK_NVME_CMD_GET_FEATURES = 0x0A,
 	BRECK_NVME_CMD_GET_LOG_PAGE = 0x02,
+	BRECK_NVME_CMD_RESET_INTERPOSER_CONFIG = 0xE8,
 	/*Add other commands support here*/
 } breck_nvme_cmd_opcodes_t;
 
-/* CPP SUpported features */
+/* CPP Supported features */
 typedef enum breck_set_feat_id_e {
 	BRECK_NVME_SET_FEAT_INTERPOSER_CONFIG = 0xD1,
+	BRECK_NVME_SET_FEAT_INVALID = 0xFF,
 	/*Add other set feature identifiers here*/
 } breck_set_feat_id_t;
+
+static inline const char*
+feature_str(breck_set_feat_id_t type)
+{
+#define A2STR(_tag)                                                            \
+  case BRECK_NVME_SET_FEAT_##_tag:                                                \
+    return #_tag;
+  switch( type ) {
+    A2STR(INTERPOSER_CONFIG);
+    A2STR(INVALID);
+  }
+#undef A2STR
+  return "<unknown>";
+}
+
+static inline const char*
+nvme_cmd_str(breck_nvme_cmd_opcodes_t type)
+{
+#define A2STR(_tag)                                                            \
+  case BRECK_NVME_CMD_##_tag:                                                \
+    return #_tag;
+  switch( type ) {
+    A2STR(SET_FEATURES);
+    A2STR(GET_FEATURES);
+    A2STR(RESET_INTERPOSER_CONFIG);
+    A2STR(CREATE_CHILD_CTRLR);
+    A2STR(CREATE_NAMESPACE);
+    A2STR(ATTACH_NAMESPACE);
+    A2STR(DETACH_NAMESPACE);
+    A2STR(DELETE_NAMESPACE);
+    A2STR(GET_LOG_PAGE);
+  }
+#undef A2STR
+  return "<unknown>";
+}
+
+void dump_req(const char *cmd, struct nvme_mi_admin_req_hdr *req, const unsigned char *buf, size_t req_data_len)
+{
+	printf("\n\n------ %s ------\n", cmd);
+
+	printf("Admin request:\n");
+	printf(" opcode:  0x%02x\n", req->opcode);
+	printf(" flags:   0x%02x\n", req->flags);
+	printf(" ctrl:    0x%04x\n", le16_to_cpu(req->ctrl_id));
+	printf(" cdw1:    0x%08x\n", le32_to_cpu(req->cdw1));
+	printf(" cdw2:    0x%08x\n", le32_to_cpu(req->cdw2));
+	printf(" cdw3:    0x%08x\n", le32_to_cpu(req->cdw3));
+	printf(" cdw4:    0x%08x\n", le32_to_cpu(req->cdw4));
+	printf(" cdw5:    0x%08x\n", le32_to_cpu(req->cdw5));
+	printf(" d_off:   0x%08x\n", le32_to_cpu(req->doff));
+	printf(" d_len:   0x%08x\n", le32_to_cpu(req->dlen));
+	printf(" cdw10:   0x%08x\n", le32_to_cpu(req->cdw10));
+	printf(" cdw11:   0x%08x\n", le32_to_cpu(req->cdw11));
+	printf(" cdw12:   0x%08x\n", le32_to_cpu(req->cdw12));
+	printf(" cdw13:   0x%08x\n", le32_to_cpu(req->cdw13));
+	printf(" cdw14:   0x%08x\n", le32_to_cpu(req->cdw14));
+	printf(" cdw15:   0x%08x\n", le32_to_cpu(req->cdw15));
+
+        printf(" data [%zd bytes]\n", req_data_len);
+        hexdump(buf + sizeof(*req), req_data_len);
+}
+
+void dump_resp(const char *cmd,  struct nvme_mi_admin_resp_hdr *resp, const unsigned char *buf, size_t resp_data_len)
+{
+        printf("\nAdmin response:\n");
+        printf(" MI message header:\n");
+        printf("  type:  0x%02x\n", resp->hdr.type);
+        printf("  nmp:   0x%02x\n", resp->hdr.nmp);
+        printf("  meb:   0x%02x\n", resp->hdr.meb);
+        printf("  rsvd:  0x%02x\n", resp->hdr.rsvd0);
+        printf(" Status: 0x%02x\n", resp->status);
+        if (resp->status == 0x4) { /* Invalid parameter error */
+                printf(" PEL:");
+                printf(" 0x%02x 0x%02x 0x%02x\n",
+                                resp->rsvd0[2], resp->rsvd0[1], resp->rsvd0[0]);
+        }
+
+        printf(" cdw0:   0x%08x\n", le32_to_cpu(resp->cdw0));
+        printf(" cdw1:   0x%08x\n", le32_to_cpu(resp->cdw1));
+        printf(" cdw3:   0x%08x\n", le32_to_cpu(resp->cdw3));
+
+	printf(" data [%zd bytes]\n", resp_data_len);
+	hexdump(buf + sizeof(*resp), resp_data_len);
+}
 
 int do_set_features_breck(nvme_mi_ep_t ep, cmd_mvni_req_t* req_data, cmd_mvni_resp_t* resp_data)
 {
@@ -787,10 +870,7 @@ int do_set_features_breck(nvme_mi_ep_t ep, cmd_mvni_req_t* req_data, cmd_mvni_re
 	req->ctrl_id = cpu_to_le16(ctrl_id);
 
 	fid = NVME_GET(req->cdw10, FEATURES_CDW10_FID);
-	printf("Admin request:\n");
-	printf(" opcode: 0x%02x\n", req->opcode);
-	printf(" ctrl:   0x%04x\n", le16_to_cpu(req->ctrl_id));
-	printf(" cdw10:  0x%08x\n", le32_to_cpu(req->cdw10));
+	dump_req(nvme_cmd_str(BRECK_NVME_CMD_SET_FEATURES), req, req_buf, req_data_len);
 
 	switch (fid) {
 		case BRECK_NVME_SET_FEAT_INTERPOSER_CONFIG: /* Interposer Configuration */
@@ -817,23 +897,7 @@ int do_set_features_breck(nvme_mi_ep_t ep, cmd_mvni_req_t* req_data, cmd_mvni_re
 	memcpy(resp_data, resp_buf, sizeof(struct nvme_mi_admin_resp_hdr) + resp_data_len);
 	resp_data->payload_len = resp_data_len;
 
-	printf("Admin response:\n");
-	printf(" MI message header:\n");
-	printf("  type:  0x%02x\n", resp->hdr.type);
-	printf("  nmp:   0x%02x\n", resp->hdr.nmp);
-	printf("  meb:   0x%02x\n", resp->hdr.meb);
-	printf("  rsvd:  0x%02x\n", resp->hdr.rsvd0);
-	printf(" Status: 0x%02x\n", resp->status);
-	if (resp->status == 0x4) { /* Invalid parameter error */
-		printf(" PEL:");
-		printf(" 0x%02x 0x%02x 0x%02x\n",
-				resp->rsvd0[2], resp->rsvd0[1], resp->rsvd0[0]);
-	} else if (!resp->status) {
-		printf(" cdw0:   0x%08x\n", le32_to_cpu(resp->cdw0));
-		printf(" cdw1:   0x%08x\n", le32_to_cpu(resp->cdw1));
-		printf(" cdw3:   0x%08x\n", le32_to_cpu(resp->cdw3));
-	}
-	printf("Optional response data length: %lu\n", resp_data_len);
+	dump_resp(nvme_cmd_str(BRECK_NVME_CMD_SET_FEATURES), resp, resp_buf, resp_data_len);
 
 	return 0;
 }
@@ -860,10 +924,7 @@ int do_get_features_breck(nvme_mi_ep_t ep, cmd_mvni_req_t* req_data, cmd_mvni_re
 	req->ctrl_id = cpu_to_le16(ctrl_id);
 	fid = NVME_GET(req->cdw10, FEATURES_CDW10_FID);
 
-	printf("Admin request:\n");
-	printf(" opcode: 0x%02x\n", req->opcode);
-	printf(" ctrl:   0x%04x\n", le16_to_cpu(req->ctrl_id));
-	printf(" cdw10:  0x%08x\n", le32_to_cpu(req->cdw10));
+	dump_req(nvme_cmd_str(BRECK_NVME_CMD_GET_FEATURES), req, req_buf, req_data_len);
 
 	switch (fid) {
 		case BRECK_NVME_SET_FEAT_INTERPOSER_CONFIG: /* Interposer Configuration */
@@ -890,26 +951,56 @@ int do_get_features_breck(nvme_mi_ep_t ep, cmd_mvni_req_t* req_data, cmd_mvni_re
 
 	memcpy(resp_data, resp_buf, sizeof(struct nvme_mi_admin_resp_hdr) + resp_data_len);
 	resp_data->payload_len = resp_data_len;
-	printf("Admin response:\n");
-	printf(" MI message header:\n");
-	printf("  type:  0x%02x\n", resp->hdr.type);
-	printf("  nmp:   0x%02x\n", resp->hdr.nmp);
-	printf("  meb:   0x%02x\n", resp->hdr.meb);
-	printf("  rsvd:  0x%02x\n", resp->hdr.rsvd0);
-	printf(" Status: 0x%02x\n", resp->status);
-	if (resp->status == 0x4) { /* Invalid parameter error */
-		printf(" PEL:");
-		printf(" 0x%02x 0x%02x 0x%02x\n",
-				resp->rsvd0[2], resp->rsvd0[1], resp->rsvd0[0]);
-	} else if (!resp->status) {
-		printf(" cdw0:   0x%08x\n", le32_to_cpu(resp->cdw0));
-		printf(" cdw1:   0x%08x\n", le32_to_cpu(resp->cdw1));
-		printf(" cdw3:   0x%08x\n", le32_to_cpu(resp->cdw3));
+	
+	dump_resp(nvme_cmd_str(BRECK_NVME_CMD_GET_FEATURES), resp, resp_buf, resp_data_len);
+        
+	if( fid == BRECK_NVME_SET_FEAT_INTERPOSER_CONFIG )
 		print_interposer_config((interposer_config_t *)(resp_buf + sizeof(*resp)));
-	}
-	printf("Optional response data length: %lu\n", resp_data_len);
-
+	
 	return 0;
+}
+
+int do_reset_ip_cfg_breck(nvme_mi_ep_t ep, cmd_mvni_req_t* req_data, cmd_mvni_resp_t* resp_data)
+{
+        struct nvme_mi_admin_resp_hdr *resp;
+        struct nvme_mi_admin_req_hdr *req;
+        uint8_t resp_buf[512] = {0};
+        uint8_t req_buf[512] = {0};
+        struct nvme_mi_ctrl *ctrl;
+        size_t resp_data_len = 0;
+        size_t req_data_len;
+        uint16_t ctrl_id;
+        int rc;
+        ctrl_id = 0; /* Management Controller */
+
+        req = (struct nvme_mi_admin_req_hdr *)req_buf;
+        resp = (struct nvme_mi_admin_resp_hdr *)resp_buf;
+
+        memcpy(&req->opcode, req_data->nvme_cmd, sizeof(struct nvme_mi_admin_req_hdr) + req_data->payload_len);
+        req_data_len = req_data->payload_len;
+        req->ctrl_id = cpu_to_le16(ctrl_id);
+
+	dump_req(nvme_cmd_str(BRECK_NVME_CMD_RESET_INTERPOSER_CONFIG), req, req_buf, req_data_len);
+
+        ctrl = nvme_mi_init_ctrl(ep, ctrl_id);
+        if (!ctrl) {
+                warn("can't create controller");
+                return -1;
+        }
+
+        printf(" req_data_len: %lu\n", req_data_len);
+
+        rc = nvme_mi_admin_xfer(ctrl, req, req_data_len, resp, 0, &resp_data_len);
+        if (rc) {
+                warn("nvme_admin_xfer failed: %d", rc);
+                return -1;
+        }
+
+        memcpy(resp_data, resp_buf, sizeof(struct nvme_mi_admin_resp_hdr) + resp_data_len);
+        resp_data->payload_len = resp_data_len;
+	dump_resp(nvme_cmd_str(BRECK_NVME_CMD_RESET_INTERPOSER_CONFIG), resp, resp_buf, resp_data_len);
+
+        return 0;
 }
 
 int do_admin_raw_breck(nvme_mi_ep_t ep, cmd_mvni_req_t* req_data, cmd_mvni_resp_t* resp_data)
@@ -923,6 +1014,9 @@ int do_admin_raw_breck(nvme_mi_ep_t ep, cmd_mvni_req_t* req_data, cmd_mvni_resp_
 			break;
 		case BRECK_NVME_CMD_GET_FEATURES:
 			do_get_features_breck(ep, req_data, resp_data);
+			break;
+		case BRECK_NVME_CMD_RESET_INTERPOSER_CONFIG:
+			do_reset_ip_cfg_breck(ep, req_data, resp_data);
 			break;
 		default:
 			printf("Breck cmd opcode not supported: 0x%02x.", req.opcode);
