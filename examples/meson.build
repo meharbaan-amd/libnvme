@@ -5,6 +5,9 @@
 #
 # Authors: Martin Belanger <Martin.Belanger@dell.com>
 #
+
+thread_dep = dependency('threads')
+
 executable(
     'telemetry-listen',
     ['telemetry-listen.c'],
@@ -36,7 +39,7 @@ executable(
 executable(
     'mi-mctp',
     ['mi-mctp.c'],
-    dependencies: libnvme_mi_dep,
+    dependencies: [libnvme_mi_dep, thread_dep],
     include_directories: [incdir, internal_incdir]
 )
 
