@@ -17,11 +17,210 @@
 #include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <pthread.h>
 
 #include <libnvme-mi.h>
 
 #include <ccan/array_size/array_size.h>
 #include <ccan/endian/endian.h>
+
+nvme_mi_ep_t g_ep;
+
+/* MVNI Payload maximum length is subject to change is needed.*/
+#define MVNI_PAYLOAD_LEN_MAX 1024
+/* 64 bytes standard NVME command.*/
+#define NVME_REQ_CMD_LEN 64
+/* 20 bytes standard NVME-MI command response.*/
+#define NVME_RESP_CMD_LEN 20
+
+/** MVNI request object for snapper core*/
+typedef struct cmd_mvni_req_s {
+	/** Command associated with request */
+	uint8_t nvme_cmd[NVME_REQ_CMD_LEN];
+	/** Payload buffer*/
+	uint8_t payload[MVNI_PAYLOAD_LEN_MAX];
+	/** Payload length in the message*/
+	uint16_t payload_len;
+} cmd_mvni_req_t;
+
+
+/** MVNI request object for snapper core*/
+typedef struct cmd_mvni_resp_s {
+	/** Command associated with request */
+	uint8_t nvme_cmd[NVME_RESP_CMD_LEN];
+	/** Payload buffer*/
+	uint8_t payload[MVNI_PAYLOAD_LEN_MAX];
+	/** Return code recieved in response */
+	uint16_t rc;
+	/** Payload length in the message*/
+	uint16_t payload_len;
+} cmd_mvni_resp_t;
+
+void print_hex(char* str, const void *ptr, size_t size) {
+	printf("%s:\n", str);
+	const uint8_t *byte = (const uint8_t *)ptr;
+	for (size_t i = 0; i < size; i++) {
+		printf("%02X ", byte[i]);
+	}
+	printf("\n");
+}
+
+int do_admin_raw_breck(nvme_mi_ep_t ep, cmd_mvni_req_t* req_data, cmd_mvni_resp_t* resp_data);
+
+#define INTERPOSER_CONF_RESERVED_BYTES	49
+
+#define MVNI_SOCKET_PORT 8080
+
+// Function to handle each client in a separate thread
+void *handle_client(void *client_sock_ptr) {
+	int client_sock = *(int *)client_sock_ptr;
+	free(client_sock_ptr);  // Free dynamically allocated memory
+	ssize_t bytes_received;
+	cmd_mvni_req_t req_data;
+	cmd_mvni_resp_t resp_data;
+
+	typedef struct {
+		int id;
+		char message[50];
+	} DataPacket;
+
+	DataPacket packet;
+	// Receive data from client
+	bytes_received = recv(client_sock, &packet, sizeof(DataPacket), 0);
+	if (bytes_received > 0) {
+		printf("Received from client: ID=%d, Message=%s\n", packet.id, packet.message);
+
+		// Modify the response
+		packet.id += 1;
+		strcpy(packet.message, "Acknowledged by master");
+
+		// Send response back to client
+		if (send(client_sock, &packet, sizeof(DataPacket), 0) < 0) {
+			perror("Send failed");
+			goto error;
+		}
+	} else if (bytes_received == 0) {
+		// Client disconnected
+		printf("Client disconnected.\n");
+		goto error;
+	} else {
+		perror("Receive failed");
+		goto error;
+	}
+
+	while (1) {
+		memset(&req_data, 0, sizeof(cmd_mvni_req_t));
+		memset(&resp_data, 0, sizeof(cmd_mvni_resp_t));
+		ssize_t bytes_received = recv(client_sock, &req_data, sizeof(cmd_mvni_req_t), 0);
+		if (bytes_received>0) {
+			printf("Received from master.");
+			print_hex("nvme_cmd===", (void*)req_data.nvme_cmd, NVME_REQ_CMD_LEN);
+			printf("payload_len===%d\n", req_data.payload_len);
+			print_hex("payload===", (void*)req_data.payload, req_data.payload_len);
+			if (!do_admin_raw_breck(g_ep, &req_data, &resp_data))
+			{
+				if (send(client_sock, &resp_data, sizeof(cmd_mvni_resp_t), 0) < 0)
+					perror("Send failed");
+
+			}
+			else
+			{
+				printf("command processing failed on cpp.!!!");
+				resp_data.rc = -1;
+				if (send(client_sock, &resp_data, sizeof(cmd_mvni_resp_t), 0) < 0)
+					perror("Send failed");
+			}
+		}
+		else if (bytes_received ==0){
+			printf("Connection closed by master.\n");
+			break;
+		}
+		else
+		{
+			perror("Receive Failed\n");
+			break;
+		}
+	}
+
+error:
+	close(client_sock);
+	pthread_exit(NULL);
+}
+
+int cpp_server_start()
+{
+	struct sockaddr_in server_addr, client_addr;
+	socklen_t addrlen = sizeof(server_addr);
+	int opt = 1;
+	int server_sock = 0, *client_sock_ptr;;
+
+
+	printf("CPP server starting..... on PORT=%d", MVNI_SOCKET_PORT);
+
+	// Create socket
+	if( (server_sock = socket(AF_INET, SOCK_STREAM, 0)) == 0 ) {
+		printf("Socket failed");
+		goto err;
+	}
+
+	// Set SO_REUSEADDR to avoid "Address already in use" error
+	if( setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))
+			== -1 ) {
+		printf("setsockopt failed");
+		goto err;
+	}
+
+	// Bind socket
+	server_addr.sin_family = AF_INET;
+	server_addr.sin_addr.s_addr = INADDR_ANY;
+	server_addr.sin_port = htons(MVNI_SOCKET_PORT);
+
+	if( bind(server_sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0 ) {
+		printf("Bind failed");
+		goto err;
+	}
+
+	// Listen for connections
+	if( listen(server_sock, 10) < 0 ) {
+		printf("Listen failed");
+		goto err;
+	}
+
+	printf("Waiting for connection on CPP Server.....");
+	while(1)
+	{
+		client_sock_ptr = malloc(sizeof(int));  // Allocate memory for new client socket
+		if (!client_sock_ptr) {
+			perror("Memory allocation failed");
+			goto err;
+		}
+
+		*client_sock_ptr = accept(server_sock, (struct sockaddr*)&client_addr, &addrlen);
+		if (*client_sock_ptr == -1) {
+			perror("Accept failed");
+			free(client_sock_ptr);
+			goto err;
+		}
+
+		printf("New Client connected !\n");
+
+		// Create a new thread for each client
+		pthread_t client_thread;
+		if (pthread_create(&client_thread, NULL, handle_client, client_sock_ptr) != 0) {
+			perror("Thread creation failed");
+			free(client_sock_ptr);
+			goto err;
+		}
+
+		pthread_detach(client_thread);  // Detach thread to clean up resources automatically
+	}
+
+err:
+	close(server_sock);
+	return 0;
+}
 
 static void show_port_pcie(struct nvme_mi_read_port_info *port)
 {
@@ -40,7 +239,7 @@ static void show_port_smbus(struct nvme_mi_read_port_info *port)
 	printf("    MCTP address: 0x%02x\n", port->smb.mme_addr);
 	printf("    MCTP access freq: 0x%02x\n", port->smb.mme_freq);
 	printf("    NVMe basic management: %s\n",
-	       (port->smb.nvmebm & 0x1) ? "enabled" : "disabled");
+			(port->smb.nvmebm & 0x1) ? "enabled" : "disabled");
 }
 
 static struct {
@@ -166,7 +365,7 @@ static int do_controllers(nvme_mi_ep_t ep)
 }
 
 static const char *__copy_id_str(const void *field, size_t size,
-				 char *buf, size_t buf_size)
+		char *buf, size_t buf_size)
 {
 	assert(size < buf_size);
 	strncpy(buf, field, size);
@@ -221,7 +420,7 @@ int do_identify(nvme_mi_ep_t ep, int argc, char **argv)
 	 */
 	if (partial) {
 		rc = nvme_mi_admin_identify_partial(ctrl, &id_args, 0,
-					    offsetof(struct nvme_id_ctrl, rab));
+				offsetof(struct nvme_id_ctrl, rab));
 	} else {
 		rc = nvme_mi_admin_identify(ctrl, &id_args);
 	}
@@ -300,40 +499,40 @@ int do_control_primitive(nvme_mi_ep_t ep, int argc, char **argv)
 
 	printf("NVMe control primitive\n");
 	switch (opcode) {
-	case nvme_mi_control_opcode_pause:
-		printf(" Pause : cspr is %#x\n", cpsr);
-		printf("  Pause Flag Status Slot 0: %s\n", (cpsr & (1 << 0)) ? "Yes" : "No");
-		printf("  Pause Flag Status Slot 1: %s\n", (cpsr & (1 << 1)) ? "Yes" : "No");
-		break;
-	case nvme_mi_control_opcode_resume:
-		printf(" Resume : cspr is %#x\n", cpsr);
-		break;
-	case nvme_mi_control_opcode_abort:
-		printf(" Abort : cspr is %#x\n", cpsr);
-		printf("  Command Aborted Status: %s\n", cpas_state[cpsr & 0x3]);
-		break;
-	case nvme_mi_control_opcode_get_state:
-		printf(" Get State : cspr is %#x\n", cpsr);
-		printf("  Slot Command Servicing State: %s\n", slot_state[cpsr & 0x3]);
-		printf("  Bad Message Integrity Check: %s\n", (cpsr & (1 << 4)) ? "Yes" : "No");
-		printf("  Timeout Waiting for a Packet: %s\n", (cpsr & (1 << 5)) ? "Yes" : "No");
-		printf("  Unsupported Transmission Unit: %s\n", (cpsr & (1 << 6)) ? "Yes" : "No");
-		printf("  Bad Header Version: %s\n", (cpsr & (1 << 7)) ? "Yes" : "No");
-		printf("  Unknown Destination ID: %s\n", (cpsr & (1 << 8)) ? "Yes" : "No");
-		printf("  Incorrect Transmission Unit: %s\n", (cpsr & (1 << 9)) ? "Yes" : "No");
-		printf("  Unexpected Middle or End of Packet: %s\n", (cpsr & (1 << 10)) ? "Yes" : "No");
-		printf("  Out-of-Sequence Packet Sequence Number: %s\n", (cpsr & (1 << 11)) ? "Yes" : "No");
-		printf("  Bad, Unexpected, or Expired Message Tag: %s\n", (cpsr & (1 << 12)) ? "Yes" : "No");
-		printf("  Bad Packet or Other Physical Layer: %s\n", (cpsr & (1 << 13)) ? "Yes" : "No");
-		printf("  NVM Subsystem Reset Occurred: %s\n", (cpsr & (1 << 14)) ? "Yes" : "No");
-		printf("  Pause Flag: %s\n", (cpsr & (1 << 15)) ? "Yes" : "No");
-		break;
-	case nvme_mi_control_opcode_replay:
-		printf(" Replay : cspr is %#x\n", cpsr);
-		break;
-	default:
-		/* unreachable */
-		break;
+		case nvme_mi_control_opcode_pause:
+			printf(" Pause : cspr is %#x\n", cpsr);
+			printf("  Pause Flag Status Slot 0: %s\n", (cpsr & (1 << 0)) ? "Yes" : "No");
+			printf("  Pause Flag Status Slot 1: %s\n", (cpsr & (1 << 1)) ? "Yes" : "No");
+			break;
+		case nvme_mi_control_opcode_resume:
+			printf(" Resume : cspr is %#x\n", cpsr);
+			break;
+		case nvme_mi_control_opcode_abort:
+			printf(" Abort : cspr is %#x\n", cpsr);
+			printf("  Command Aborted Status: %s\n", cpas_state[cpsr & 0x3]);
+			break;
+		case nvme_mi_control_opcode_get_state:
+			printf(" Get State : cspr is %#x\n", cpsr);
+			printf("  Slot Command Servicing State: %s\n", slot_state[cpsr & 0x3]);
+			printf("  Bad Message Integrity Check: %s\n", (cpsr & (1 << 4)) ? "Yes" : "No");
+			printf("  Timeout Waiting for a Packet: %s\n", (cpsr & (1 << 5)) ? "Yes" : "No");
+			printf("  Unsupported Transmission Unit: %s\n", (cpsr & (1 << 6)) ? "Yes" : "No");
+			printf("  Bad Header Version: %s\n", (cpsr & (1 << 7)) ? "Yes" : "No");
+			printf("  Unknown Destination ID: %s\n", (cpsr & (1 << 8)) ? "Yes" : "No");
+			printf("  Incorrect Transmission Unit: %s\n", (cpsr & (1 << 9)) ? "Yes" : "No");
+			printf("  Unexpected Middle or End of Packet: %s\n", (cpsr & (1 << 10)) ? "Yes" : "No");
+			printf("  Out-of-Sequence Packet Sequence Number: %s\n", (cpsr & (1 << 11)) ? "Yes" : "No");
+			printf("  Bad, Unexpected, or Expired Message Tag: %s\n", (cpsr & (1 << 12)) ? "Yes" : "No");
+			printf("  Bad Packet or Other Physical Layer: %s\n", (cpsr & (1 << 13)) ? "Yes" : "No");
+			printf("  NVM Subsystem Reset Occurred: %s\n", (cpsr & (1 << 14)) ? "Yes" : "No");
+			printf("  Pause Flag: %s\n", (cpsr & (1 << 15)) ? "Yes" : "No");
+			break;
+		case nvme_mi_control_opcode_replay:
+			printf(" Replay : cspr is %#x\n", cpsr);
+			break;
+		default:
+			/* unreachable */
+			break;
 	}
 
 	return 0;
@@ -513,6 +712,297 @@ int do_admin_raw(nvme_mi_ep_t ep, int argc, char **argv)
 	return 0;
 }
 
+typedef struct interposer_config_s {
+	uint8_t upstream_pci_ports;
+	uint8_t config_num_pssds;
+	uint16_t total_pssd_capacity;
+	uint16_t config_pssd_capacity;
+	uint8_t oob_support;
+	uint8_t lba_formats;
+	uint8_t propagate_reset_events_to_pssd;
+	uint8_t pssd_fill_event_threshold;
+	uint8_t log_persistence_time;
+	uint8_t overprovisioning_factor;
+	uint8_t lm_support_on_pc;
+	uint8_t max_pssd_recovery_time;
+	uint8_t oob_interfaces_roles;
+	uint8_t rsvd[INTERPOSER_CONF_RESERVED_BYTES];
+} interposer_config_t;
+
+void print_interposer_config(interposer_config_t *ip_cfg)
+{
+	printf("Interposer configuration:\n");
+	printf(" upstream_pci_ports: 0x%x\n", ip_cfg->upstream_pci_ports);
+	printf(" config_num_pssds: 0x%x\n", ip_cfg->config_num_pssds);
+	printf(" total_pssd_capacity: 0x%x\n", ip_cfg->total_pssd_capacity);
+	printf(" config_pssd_capacity: 0x%x\n", ip_cfg->config_pssd_capacity);
+	printf(" oob_support: 0x%x\n", ip_cfg->oob_support);
+	printf(" lba_formats: 0x%x\n", ip_cfg->lba_formats);
+	printf(" propagate_reset_events_to_pssd: 0x%x\n", ip_cfg->propagate_reset_events_to_pssd);
+	printf(" pssd_fill_event_threshold: 0x%x\n", ip_cfg->pssd_fill_event_threshold);
+	printf(" log_persistence_time: 0x%x\n", ip_cfg->log_persistence_time);
+	printf(" overprovisioning_factor: 0x%x\n", ip_cfg->overprovisioning_factor);
+	printf(" lm_support_on_pc: 0x%x\n", ip_cfg->lm_support_on_pc);
+	printf(" max_pssd_recovery_time: 0x%x\n", ip_cfg->max_pssd_recovery_time);
+	printf(" oob_interfaces_roles: 0x%x\n", ip_cfg->oob_interfaces_roles);
+}
+
+typedef enum breck_nvme_cmd_opcodes_e {
+	BRECK_NVME_CMD_CREATE_CHILD_CTRLR = 0xD1,
+	BRECK_NVME_CMD_CREATE_NAMESPACE = 0xD0,
+	BRECK_NVME_CMD_ATTACH_NAMESPACE = 0xD4,
+	BRECK_NVME_CMD_DETACH_NAMESPACE = 0xD8,
+	BRECK_NVME_CMD_DELETE_NAMESPACE = 0xE0,
+	BRECK_NVME_CMD_SET_FEATURES = 0x09,
+	BRECK_NVME_CMD_GET_FEATURES = 0x0A,
+	BRECK_NVME_CMD_GET_LOG_PAGE = 0x02,
+	/*Add other commands support here*/
+} breck_nvme_cmd_opcodes_t;
+
+typedef enum breck_set_feat_id_e {
+	BRECK_NVME_SET_FEAT_INTERPOSER_CONFIG = 0xD1,
+	/*Add other set feature identifiers here*/
+} breck_set_feat_id_t;
+
+int do_set_features_breck(nvme_mi_ep_t ep, cmd_mvni_req_t* req_data, cmd_mvni_resp_t* resp_data)
+{
+	struct nvme_mi_admin_resp_hdr *resp;
+	struct nvme_mi_admin_req_hdr *req;
+	uint8_t resp_buf[512] = {0};
+	uint8_t req_buf[512] = {0};
+	struct nvme_mi_ctrl *ctrl;
+	size_t resp_data_len = 0;
+	size_t req_data_len;
+	uint16_t ctrl_id;
+	//	uint8_t opcode;
+	uint8_t fid;
+	int rc;
+
+	ctrl_id = 0; /* Management Controller */
+
+	req = (struct nvme_mi_admin_req_hdr *)req_buf;
+	resp = (struct nvme_mi_admin_resp_hdr *)resp_buf;
+
+	memcpy(&req->opcode, req_data->nvme_cmd, sizeof(struct nvme_mi_admin_req_hdr) + req_data->payload_len);
+	req_data_len = req_data->payload_len;
+	req->ctrl_id = cpu_to_le16(ctrl_id);
+
+	fid = NVME_GET(req->cdw10, FEATURES_CDW10_FID);
+
+	printf("Admin request:\n");
+	printf(" opcode: 0x%02x\n", req->opcode);
+	printf(" ctrl:   0x%04x\n", le16_to_cpu(req->ctrl_id));
+	printf(" cdw10:  0x%08x\n", le32_to_cpu(req->cdw10));
+
+	switch (fid) {
+		case BRECK_NVME_SET_FEAT_INTERPOSER_CONFIG: /* Interposer Configuration */
+			print_interposer_config((interposer_config_t*)req_data->payload);
+			resp_data_len = 0;
+			break;
+		default:
+			printf("Feature id not supported\n");
+			return -1;
+	}
+
+	ctrl = nvme_mi_init_ctrl(ep, ctrl_id);
+	if (!ctrl) {
+		warn("can't create controller");
+		return -1;
+	}
+
+	printf(" req_data_len: %lu\n", req_data_len);
+	rc = nvme_mi_admin_xfer(ctrl, req, req_data_len, resp, 0, &resp_data_len);
+	if (rc) {
+		warn("nvme_admin_xfer failed: %d", rc);
+		return -1;
+	}
+
+	memcpy(resp_data, resp_buf, sizeof(struct nvme_mi_admin_resp_hdr) + resp_data_len);
+	resp_data->payload_len = resp_data_len;
+
+	printf("Admin response:\n");
+	printf(" MI message header:\n");
+	printf("  type:  0x%02x\n", resp->hdr.type);
+	printf("  nmp:   0x%02x\n", resp->hdr.nmp);
+	printf("  meb:   0x%02x\n", resp->hdr.meb);
+	printf("  rsvd:  0x%02x\n", resp->hdr.rsvd0);
+	printf(" Status: 0x%02x\n", resp->status);
+	if (resp->status == 0x4) { /* Invalid parameter error */
+		printf(" PEL:");
+		printf(" 0x%02x 0x%02x 0x%02x\n",
+				resp->rsvd0[2], resp->rsvd0[1], resp->rsvd0[0]);
+	} else if (!resp->status) {
+		printf(" cdw0:   0x%08x\n", le32_to_cpu(resp->cdw0));
+		printf(" cdw1:   0x%08x\n", le32_to_cpu(resp->cdw1));
+		printf(" cdw3:   0x%08x\n", le32_to_cpu(resp->cdw3));
+	}
+	printf("Optional response data length: %lu\n", resp_data_len);
+
+	return 0;
+}
+
+int do_get_features_breck(nvme_mi_ep_t ep, cmd_mvni_req_t* req_data, cmd_mvni_resp_t* resp_data)
+{
+	struct nvme_mi_admin_resp_hdr *resp;
+	struct nvme_mi_admin_req_hdr *req;
+	uint8_t resp_buf[512] = {0};
+	uint8_t req_buf[512] = {0};
+	struct nvme_mi_ctrl *ctrl;
+	size_t resp_data_len = 0;
+	size_t req_data_len;
+	uint16_t ctrl_id;
+	//      uint8_t opcode;
+	uint8_t fid;
+	int rc;
+
+	ctrl_id = 0; /* Management Controller */
+
+	req = (struct nvme_mi_admin_req_hdr *)req_buf;
+	resp = (struct nvme_mi_admin_resp_hdr *)resp_buf;
+
+	memcpy(&req->opcode, req_data->nvme_cmd, sizeof(struct nvme_mi_admin_req_hdr) + req_data->payload_len);
+	req_data_len = req_data->payload_len;
+	req->ctrl_id = cpu_to_le16(ctrl_id);
+
+	fid = NVME_GET(req->cdw10, FEATURES_CDW10_FID);
+
+	printf("Admin request:\n");
+	printf(" opcode: 0x%02x\n", req->opcode);
+	printf(" ctrl:   0x%04x\n", le16_to_cpu(req->ctrl_id));
+	printf(" cdw10:  0x%08x\n", le32_to_cpu(req->cdw10));
+
+	switch (fid) {
+		case BRECK_NVME_SET_FEAT_INTERPOSER_CONFIG: /* Interposer Configuration */
+			resp_data_len = sizeof(interposer_config_t);
+			break;
+		default:
+			printf("Feature id not supported\n");
+			return -1;
+	}
+
+	ctrl = nvme_mi_init_ctrl(ep, ctrl_id);
+	if (!ctrl) {
+		warn("can't create controller");
+		return -1;
+	}
+
+	printf(" req_data_len: %lu\n", req_data_len);
+	rc = nvme_mi_admin_xfer(ctrl, req, req_data_len, resp, 0, &resp_data_len);
+	if (rc) {
+		warn("nvme_admin_xfer failed: %d", rc);
+		return -1;
+	}
+
+	memcpy(resp_data, resp_buf, sizeof(struct nvme_mi_admin_resp_hdr) + resp_data_len);
+	resp_data->payload_len = resp_data_len;
+
+	printf("Admin response:\n");
+	printf(" MI message header:\n");
+	printf("  type:  0x%02x\n", resp->hdr.type);
+	printf("  nmp:   0x%02x\n", resp->hdr.nmp);
+	printf("  meb:   0x%02x\n", resp->hdr.meb);
+	printf("  rsvd:  0x%02x\n", resp->hdr.rsvd0);
+	printf(" Status: 0x%02x\n", resp->status);
+	if (resp->status == 0x4) { /* Invalid parameter error */
+		printf(" PEL:");
+		printf(" 0x%02x 0x%02x 0x%02x\n",
+				resp->rsvd0[2], resp->rsvd0[1], resp->rsvd0[0]);
+	} else if (!resp->status) {
+		printf(" cdw0:   0x%08x\n", le32_to_cpu(resp->cdw0));
+		printf(" cdw1:   0x%08x\n", le32_to_cpu(resp->cdw1));
+		printf(" cdw3:   0x%08x\n", le32_to_cpu(resp->cdw3));
+		print_interposer_config((interposer_config_t *)(resp_buf + sizeof(*resp)));
+	}
+	printf("Optional response data length: %lu\n", resp_data_len);
+
+	return 0;
+}
+
+int do_admin_raw_breck(nvme_mi_ep_t ep, cmd_mvni_req_t* req_data, cmd_mvni_resp_t* resp_data)
+{
+
+	struct nvme_mi_admin_req_hdr req;
+	memcpy(&req.opcode, req_data->nvme_cmd, sizeof(uint8_t));
+	switch(req.opcode)
+	{
+		case BRECK_NVME_CMD_SET_FEATURES:
+			do_set_features_breck(ep, req_data, resp_data);
+			break;
+		case BRECK_NVME_CMD_GET_FEATURES:
+			do_get_features_breck(ep, req_data, resp_data);
+			break;
+		default:
+			printf("Breck cmd opcode not supported: 0x%02x.", req.opcode);
+			return 0;
+	}
+
+#if 0
+	struct nvme_mi_admin_req_hdr *req;
+	struct nvme_mi_admin_resp_hdr *resp;
+	struct nvme_mi_ctrl *ctrl;
+	size_t resp_data_len;
+	uint8_t buf[512];
+	uint16_t ctrl_id = 0;
+	int rc = 0;
+	uint8_t req_buf[512] = {0};
+	req = (struct nvme_mi_admin_req_hdr *)req_buf;
+	size_t req_data_len;
+	/* This is the admin command received by Snapper/Te Instance */
+	/* Let's fill this buffer as of now what we are seeing in Snapper SQ Entry */
+
+
+	memcpy(&req->opcode, cmd_data.nvme_cmd, sizeof(struct nvme_mi_admin_req_hdr) + cmd_data.payload_len);
+
+	req->ctrl_id = cpu_to_le16(ctrl_id);
+
+	printf("Admin request:\n");
+	printf(" opcode: 0x%02x\n", req->opcode);
+	printf(" ctrl:   0x%04x\n", le16_to_cpu(req->ctrl_id));
+	printf(" cdw10:   0x%08x\n", le32_to_cpu(req->cdw10));
+	printf(" cdw11:   0x%08x\n", le32_to_cpu(req->cdw11));
+	printf(" cdw12:   0x%08x\n", le32_to_cpu(req->cdw12));
+	printf(" cdw13:   0x%08x\n", le32_to_cpu(req->cdw13));
+	printf(" cdw14:   0x%08x\n", le32_to_cpu(req->cdw14));
+	printf(" cdw15:   0x%08x\n", le32_to_cpu(req->cdw15));
+	printf(" raw:\n");
+
+	hexdump((void *)&req, sizeof(req));
+
+	print_interposer_config((interposer_config_t*)cmd_data.payload);
+
+	memset(buf, 0, sizeof(buf));
+	resp = (void *)buf;
+
+	ctrl = nvme_mi_init_ctrl(ep, ctrl_id);
+	if (!ctrl) {
+		warn("can't create controller");
+		return -1;
+	}
+
+	//	resp_data_len = sizeof(buf) - sizeof(*resp);
+	//	resp_data_len = resp_len;
+	resp_data_len = 0;
+	memcpy(&req->opcode, cmd_data.nvme_cmd, sizeof(struct nvme_mi_admin_req_hdr));
+	req_data_len = cmd_data.payload_len /* Request header */;
+	printf(" req_data_len: %lu\n", req_data_len);
+	rc = nvme_mi_admin_xfer(ctrl, req, req_data_len, resp, 0, &resp_data_len);
+	if (rc) {
+		warn("nvme_admin_xfer failed: %d", rc);
+		return -1;
+	}
+
+	printf("Admin response:\n");
+	printf(" Status: 0x%02x\n", resp->status);
+	printf(" cdw0:   0x%08x\n", le32_to_cpu(resp->cdw0));
+	printf(" cdw1:   0x%08x\n", le32_to_cpu(resp->cdw1));
+	printf(" cdw3:   0x%08x\n", le32_to_cpu(resp->cdw3));
+	printf(" data [%zd bytes]\n", resp_data_len);
+
+	hexdump(buf + sizeof(*resp), resp_data_len);
+#endif
+	return 0;
+}
+
 static struct {
 	uint8_t id;
 	const char *name;
@@ -585,14 +1075,14 @@ int do_security_info(nvme_mi_ep_t ep, int argc, char **argv)
 
 	if (args.data_len < 6) {
 		warnx("Short response in security receive command (%d bytes)",
-		      args.data_len);
+				args.data_len);
 		return -1;
 	}
 
 	n_proto = be16_to_cpu(proto_info.len);
 	if (args.data_len < 6 + n_proto) {
 		warnx("Short response in security receive command (%d bytes), "
-		      "for %d protocols", args.data_len, n_proto);
+				"for %d protocols", args.data_len, n_proto);
 		return -1;
 	}
 
@@ -658,7 +1148,7 @@ int do_config_get(nvme_mi_ep_t ep, int argc, char **argv)
 	} else {
 		const char *fstr = smbus_freq_str(freq);
 		printf("SMBus access frequency (port %d): %s [0x%x]\n", port,
-		       fstr ?: "unknown", freq);
+				fstr ?: "unknown", freq);
 	}
 
 	rc = nvme_mi_mi_config_get_mctp_mtu(ep, port, &mtu);
@@ -690,7 +1180,7 @@ int do_config_set(nvme_mi_ep_t ep, int argc, char **argv)
 		rc = smbus_freq_val(val, &freq);
 		if (rc) {
 			fprintf(stderr, "unknown SMBus freq %s. "
-				"Try 100k, 400k or 1M\n", val);
+					"Try 100k, 400k or 1M\n", val);
 			return -1;
 		}
 		rc = nvme_mi_mi_config_set_smbus_freq(ep, port, freq);
@@ -709,7 +1199,7 @@ int do_config_set(nvme_mi_ep_t ep, int argc, char **argv)
 
 	} else {
 		fprintf(stderr, "Invalid configuration '%s', "
-			"try freq or mtu\n", name);
+				"try freq or mtu\n", name);
 		return -1;
 	}
 
@@ -725,6 +1215,7 @@ enum action {
 	ACTION_IDENTIFY,
 	ACTION_GET_LOG_PAGE,
 	ACTION_ADMIN_RAW,
+	ACTION_ADMIN_RAW_BRECK,
 	ACTION_SECURITY_INFO,
 	ACTION_CONFIG_GET,
 	ACTION_CONFIG_SET,
@@ -736,39 +1227,43 @@ static int do_action_endpoint(enum action action, nvme_mi_ep_t ep, int argc, cha
 	int rc;
 
 	switch (action) {
-	case ACTION_INFO:
-		rc = do_info(ep);
-		break;
-	case ACTION_CONTROLLERS:
-		rc = do_controllers(ep);
-		break;
-	case ACTION_IDENTIFY:
-		rc = do_identify(ep, argc, argv);
-		break;
-	case ACTION_GET_LOG_PAGE:
-		rc = do_get_log_page(ep, argc, argv);
-		break;
-	case ACTION_ADMIN_RAW:
-		rc = do_admin_raw(ep, argc, argv);
-		break;
-	case ACTION_SECURITY_INFO:
-		rc = do_security_info(ep, argc, argv);
-		break;
-	case ACTION_CONFIG_GET:
-		rc = do_config_get(ep, argc, argv);
-		break;
-	case ACTION_CONFIG_SET:
-		rc = do_config_set(ep, argc, argv);
-		break;
-	case ACTION_CONTROL_PRIMITIVE:
-		rc = do_control_primitive(ep, argc, argv);
-		break;
-	default:
-		/* This shouldn't be possible, as we should be covering all
-		 * of the enum action options above. Hoever, keep the compilers
-		 * happy and fail gracefully. */
-		fprintf(stderr, "invalid action %d?\n", action);
-		rc = -1;
+		case ACTION_INFO:
+			rc = do_info(ep);
+			break;
+		case ACTION_CONTROLLERS:
+			rc = do_controllers(ep);
+			break;
+		case ACTION_IDENTIFY:
+			rc = do_identify(ep, argc, argv);
+			break;
+		case ACTION_GET_LOG_PAGE:
+			rc = do_get_log_page(ep, argc, argv);
+			break;
+		case ACTION_ADMIN_RAW_BRECK:
+			/*Do nothing, its handled seperatley.*/
+			rc = 0;
+			break;
+		case ACTION_ADMIN_RAW:
+			rc = do_admin_raw(ep, argc, argv);
+			break;
+		case ACTION_SECURITY_INFO:
+			rc = do_security_info(ep, argc, argv);
+			break;
+		case ACTION_CONFIG_GET:
+			rc = do_config_get(ep, argc, argv);
+			break;
+		case ACTION_CONFIG_SET:
+			rc = do_config_set(ep, argc, argv);
+			break;
+		case ACTION_CONTROL_PRIMITIVE:
+			rc = do_control_primitive(ep, argc, argv);
+
+		default:
+			/* This shouldn't be possible, as we should be covering all
+			 * of the enum action options above. Hoever, keep the compilers
+			 * happy and fail gracefully. */
+			fprintf(stderr, "invalid action %d?\n", action);
+			rc = -1;
 	}
 	return rc;
 }
@@ -781,6 +1276,9 @@ int main(int argc, char **argv)
 	bool dbus = false, usage = true;
 	uint8_t eid = 0;
 	int rc = 0, net = 0;
+	char *third_argv = argv[3];
+
+	printf("laaaaaalalalalllllllllllalll\n");
 
 	if (argc >= 2 && strcmp(argv[1], "dbus") == 0) {
 		usage = false;
@@ -797,24 +1295,26 @@ int main(int argc, char **argv)
 
 	if (usage) {
 		fprintf(stderr,
-			"usage: %s <net> <eid> [action] [action args]\n"
-			"       %s 'dbus'      [action] [action args]\n",
-			argv[0], argv[0]);
+				"usage: %s <net> <eid> [action] [action args]\n"
+				"       %s 'dbus'      [action] [action args]\n",
+				argv[0], argv[0]);
 		fprintf(stderr, "where action is:\n"
-			"  info\n"
-			"  controllers\n"
-			"  identify <controller-id> [--partial]\n"
-			"  get-log-page <controller-id> [<log-id>]\n"
-			"  admin <controller-id> <opcode> [<cdw10>, <cdw11>, ...]\n"
-			"  security-info <controller-id>\n"
-			"  get-config [port]\n"
-			"  set-config <port> <type> <val>\n"
-			"  control-primitive [action(abort|pause|resume|get-state|replay)]\n"
-			"\n"
-			"  'dbus' target will query D-Bus for known MCTP endpoints\n"
-			);
+				"  info\n"
+				"  controllers\n"
+				"  identify <controller-id> [--partial]\n"
+				"  get-log-page <controller-id> [<log-id>]\n"
+				"  admin <controller-id> <opcode> [<cdw10>, <cdw11>, ...]\n"
+				"  security-info <controller-id>\n"
+				"  get-config [port]\n"
+				"  set-config <port> <type> <val>\n"
+				"  control-primitive [action(abort|pause|resume|get-state|replay)]\n"
+				"\n"
+				"  'dbus' target will query D-Bus for known MCTP endpoints\n"
+		       );
 		return EXIT_FAILURE;
 	}
+
+	printf("argv[1]=%s\n", argv[1]);
 
 	if (argc == 1) {
 		action = ACTION_INFO;
@@ -822,7 +1322,7 @@ int main(int argc, char **argv)
 		char *action_str = argv[1];
 		argc--;
 		argv++;
-
+                printf("argv[1]=%s & action_str=%s\n", argv[1], action_str);
 		if (!strcmp(action_str, "info")) {
 			action = ACTION_INFO;
 		} else if (!strcmp(action_str, "controllers")) {
@@ -833,6 +1333,8 @@ int main(int argc, char **argv)
 			action = ACTION_GET_LOG_PAGE;
 		} else if (!strcmp(action_str, "admin")) {
 			action = ACTION_ADMIN_RAW;
+		} else if (!strcmp(action_str, "cpp-server")) {
+			action = ACTION_ADMIN_RAW_BRECK;
 		} else if (!strcmp(action_str, "security-info")) {
 			action = ACTION_SECURITY_INFO;
 		} else if (!strcmp(action_str, "get-config")) {
@@ -872,7 +1374,14 @@ int main(int argc, char **argv)
 		ep = nvme_mi_open_mctp(root, net, eid);
 		if (!ep)
 			errx(EXIT_FAILURE, "can't open MCTP endpoint %d:%d", net, eid);
-		rc = do_action_endpoint(action, ep, argc, argv);
+
+		if (strcmp(third_argv, "cpp-server") == 0) {
+			g_ep = ep;
+			rc = cpp_server_start();
+		}
+		else
+			rc = do_action_endpoint(action, ep, argc, argv);
+
 		nvme_mi_close(ep);
 		nvme_mi_free_root(root);
 	}
