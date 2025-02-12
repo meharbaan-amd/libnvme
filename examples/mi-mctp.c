@@ -1046,6 +1046,49 @@ int do_create_child_ctrlr_breck(nvme_mi_ep_t ep, cmd_mvni_req_t* req_data, cmd_m
         return 0;
 }
 
+int do_create_ns_breck(nvme_mi_ep_t ep, cmd_mvni_req_t* req_data, cmd_mvni_resp_t* resp_data)
+{
+        struct nvme_mi_admin_resp_hdr *resp;
+        struct nvme_mi_admin_req_hdr *req;
+        uint8_t resp_buf[512] = {0};
+        uint8_t req_buf[512] = {0};
+        struct nvme_mi_ctrl *ctrl;
+        size_t resp_data_len = 0;
+        size_t req_data_len;
+        uint16_t ctrl_id;
+        int rc;
+        ctrl_id = 0; /* Management Controller */
+
+        req = (struct nvme_mi_admin_req_hdr *)req_buf;
+        resp = (struct nvme_mi_admin_resp_hdr *)resp_buf;
+
+        memcpy(&req->opcode, req_data->nvme_cmd, sizeof(struct nvme_mi_admin_req_hdr) + req_data->payload_len);
+        req_data_len = req_data->payload_len;
+        req->ctrl_id = cpu_to_le16(ctrl_id);
+
+	dump_req(nvme_cmd_str(BRECK_NVME_CMD_CREATE_NAMESPACE), req, req_buf, req_data_len);
+
+        ctrl = nvme_mi_init_ctrl(ep, ctrl_id);
+        if (!ctrl) {
+                warn("can't create controller");
+                return -1;
+        }
+
+        printf(" req_data_len: %lu\n", req_data_len);
+
+        rc = nvme_mi_admin_xfer(ctrl, req, req_data_len, resp, 0, &resp_data_len);
+        if (rc) {
+                warn("nvme_admin_xfer failed: %d", rc);
+                return -1;
+        }
+
+        memcpy(resp_data, resp_buf, sizeof(struct nvme_mi_admin_resp_hdr) + resp_data_len);
+        resp_data->payload_len = resp_data_len;
+	dump_resp(nvme_cmd_str(BRECK_NVME_CMD_CREATE_NAMESPACE), resp, resp_buf, resp_data_len);
+
+        return 0;
+}
+
 int do_admin_raw_breck(nvme_mi_ep_t ep, cmd_mvni_req_t* req_data, cmd_mvni_resp_t* resp_data)
 {
 	struct nvme_mi_admin_req_hdr req;
@@ -1063,6 +1106,9 @@ int do_admin_raw_breck(nvme_mi_ep_t ep, cmd_mvni_req_t* req_data, cmd_mvni_resp_
 			break;
 		case BRECK_NVME_CMD_CREATE_CHILD_CTRLR:
 			do_create_child_ctrlr_breck(ep, req_data, resp_data);
+			break;
+		case BRECK_NVME_CMD_CREATE_NAMESPACE:
+			do_create_ns_breck(ep, req_data, resp_data);
 			break;
 		default:
 			printf("Breck cmd opcode not supported: 0x%02x.", req.opcode);
