@@ -116,20 +116,26 @@ void *handle_client(void *client_sock_ptr) {
 		memset(&req_data, 0, sizeof(cmd_mvni_req_t));
 		memset(&resp_data, 0, sizeof(cmd_mvni_resp_t));
 		ssize_t bytes_received = recv(client_sock, &req_data, sizeof(cmd_mvni_req_t), 0);
-
+		ssize_t bytes_sent = 0;
+                
+		printf("recieved %ld bytes.sizeof(cmd_mvni_req_t)=%lu \n", bytes_received, sizeof(cmd_mvni_req_t));
 		if (bytes_received>0) {
 			printf("Received from master.\n");
 			
 			if (!do_admin_raw_breck(g_ep, &req_data, &resp_data))
 			{
-				if (send(client_sock, &resp_data, sizeof(cmd_mvni_resp_t), 0) < 0)
+				bytes_sent = send(client_sock, &resp_data, sizeof(cmd_mvni_resp_t), 0);
+		                printf("sent %ld bytes. sizeof(cmd_mvni_resp_t)=%lu \n", bytes_sent, sizeof(cmd_mvni_resp_t));
+				if (bytes_sent < 0)
 					perror("Send failed");
 			}
 			else
 			{
 				printf("command processing failed on cpp.!!!\n");
 				resp_data.rc = -1;
-				if (send(client_sock, &resp_data, sizeof(cmd_mvni_resp_t), 0) < 0)
+				bytes_sent = send(client_sock, &resp_data, sizeof(cmd_mvni_resp_t), 0);
+		                printf("sent %ld bytes. sizeof(cmd_mvni_resp_t)=%lu \n", bytes_sent, sizeof(cmd_mvni_resp_t));
+				if ( bytes_sent < 0)
 					perror("Send failed");
 			}
 		}
@@ -145,6 +151,7 @@ void *handle_client(void *client_sock_ptr) {
 	}
 
 error:
+	sleep(1);
 	close(client_sock);
 	pthread_exit(NULL);
 }
@@ -865,9 +872,11 @@ int do_set_features_breck(nvme_mi_ep_t ep, cmd_mvni_req_t* req_data, cmd_mvni_re
 	req = (struct nvme_mi_admin_req_hdr *)req_buf;
 	resp = (struct nvme_mi_admin_resp_hdr *)resp_buf;
 
+	printf(" req_data->payload_len: %u\n", req_data->payload_len);
 	memcpy(&req->opcode, req_data->nvme_cmd, sizeof(struct nvme_mi_admin_req_hdr) + req_data->payload_len);
 	req_data_len = req_data->payload_len;
 	req->ctrl_id = cpu_to_le16(ctrl_id);
+	
 
 	fid = NVME_GET(req->cdw10, FEATURES_CDW10_FID);
 	dump_req(nvme_cmd_str(BRECK_NVME_CMD_SET_FEATURES), req, req_buf, req_data_len);
@@ -888,7 +897,6 @@ int do_set_features_breck(nvme_mi_ep_t ep, cmd_mvni_req_t* req_data, cmd_mvni_re
 		return -1;
 	}
 
-	printf(" req_data_len: %lu\n", req_data_len);
 	rc = nvme_mi_admin_xfer(ctrl, req, req_data_len, resp, 0, &resp_data_len);
 	if (rc) {
 		warn("nvme_admin_xfer failed: %d", rc);
@@ -1089,6 +1097,94 @@ int do_create_ns_breck(nvme_mi_ep_t ep, cmd_mvni_req_t* req_data, cmd_mvni_resp_
         return 0;
 }
 
+int do_attach_ns_breck(nvme_mi_ep_t ep, cmd_mvni_req_t* req_data, cmd_mvni_resp_t* resp_data)
+{
+        struct nvme_mi_admin_resp_hdr *resp;
+        struct nvme_mi_admin_req_hdr *req;
+        uint8_t resp_buf[512] = {0};
+        uint8_t req_buf[512] = {0};
+        struct nvme_mi_ctrl *ctrl;
+        size_t resp_data_len = 0;
+        size_t req_data_len;
+        uint16_t ctrl_id;
+        int rc;
+        ctrl_id = 0; /* Management Controller */
+
+        req = (struct nvme_mi_admin_req_hdr *)req_buf;
+        resp = (struct nvme_mi_admin_resp_hdr *)resp_buf;
+
+        memcpy(&req->opcode, req_data->nvme_cmd, sizeof(struct nvme_mi_admin_req_hdr) + req_data->payload_len);
+        req_data_len = req_data->payload_len;
+        req->ctrl_id = cpu_to_le16(ctrl_id);
+
+	dump_req(nvme_cmd_str(BRECK_NVME_CMD_ATTACH_NAMESPACE), req, req_buf, req_data_len);
+
+        ctrl = nvme_mi_init_ctrl(ep, ctrl_id);
+        if (!ctrl) {
+                warn("can't create controller");
+                return -1;
+        }
+
+        printf(" req_data_len: %lu\n", req_data_len);
+
+        rc = nvme_mi_admin_xfer(ctrl, req, req_data_len, resp, 0, &resp_data_len);
+        if (rc) {
+                warn("nvme_admin_xfer failed: %d", rc);
+                return -1;
+        }
+
+        memcpy(resp_data, resp_buf, sizeof(struct nvme_mi_admin_resp_hdr) + resp_data_len);
+        resp_data->payload_len = resp_data_len;
+	dump_resp(nvme_cmd_str(BRECK_NVME_CMD_ATTACH_NAMESPACE), resp, resp_buf, resp_data_len);
+
+        return 0;
+}
+
+int do_get_log_page_breck(nvme_mi_ep_t ep, cmd_mvni_req_t* req_data, cmd_mvni_resp_t* resp_data)
+{
+        struct nvme_mi_admin_resp_hdr *resp;
+        struct nvme_mi_admin_req_hdr *req;
+        uint8_t resp_buf[4096] = {0};
+        uint8_t req_buf[512] = {0};
+        struct nvme_mi_ctrl *ctrl;
+        size_t resp_data_len = 0;
+        size_t req_data_len;
+        uint16_t ctrl_id;
+        int rc;
+        ctrl_id = 0; /* Management Controller */
+
+        req = (struct nvme_mi_admin_req_hdr *)req_buf;
+        resp = (struct nvme_mi_admin_resp_hdr *)resp_buf;
+
+        memcpy(&req->opcode, req_data->nvme_cmd, sizeof(struct nvme_mi_admin_req_hdr));
+        req_data_len = 0;
+        req->ctrl_id = cpu_to_le16(ctrl_id);
+        resp_data_len = req_data->payload_len;
+
+        printf(" req_data_len: %lu resp_data_len: %lu \n", req_data_len, resp_data_len);
+
+	dump_req(nvme_cmd_str(BRECK_NVME_CMD_GET_LOG_PAGE), req, req_buf, req_data_len);
+
+        ctrl = nvme_mi_init_ctrl(ep, ctrl_id);
+        if (!ctrl) {
+                warn("can't create controller");
+                return -1;
+        }
+
+        rc = nvme_mi_admin_xfer(ctrl, req, req_data_len, resp, 0, &resp_data_len);
+
+        if (rc) {
+                warn("nvme_admin_xfer failed: %d", rc);
+                return -1;
+        }
+
+        memcpy(resp_data, resp_buf, sizeof(struct nvme_mi_admin_resp_hdr) + resp_data_len);
+        resp_data->payload_len = resp_data_len;
+	dump_resp(nvme_cmd_str(BRECK_NVME_CMD_GET_LOG_PAGE), resp, resp_buf, resp_data_len);
+
+        return 0;
+}
+
 int do_admin_raw_breck(nvme_mi_ep_t ep, cmd_mvni_req_t* req_data, cmd_mvni_resp_t* resp_data)
 {
 	struct nvme_mi_admin_req_hdr req;
@@ -1109,6 +1205,12 @@ int do_admin_raw_breck(nvme_mi_ep_t ep, cmd_mvni_req_t* req_data, cmd_mvni_resp_
 			break;
 		case BRECK_NVME_CMD_CREATE_NAMESPACE:
 			do_create_ns_breck(ep, req_data, resp_data);
+			break;
+		case BRECK_NVME_CMD_ATTACH_NAMESPACE:
+			do_attach_ns_breck(ep, req_data, resp_data);
+			break;
+		case BRECK_NVME_CMD_GET_LOG_PAGE:
+			do_get_log_page_breck(ep, req_data, resp_data);
 			break;
 		default:
 			printf("Breck cmd opcode not supported: 0x%02x.", req.opcode);
